@@ -1,185 +1,140 @@
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
 
+// Токен бота — проверь, что он установлен в Vercel
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
-    throw new Error('TELEGRAM_BOT_TOKEN не установлен');
-}
-const bot = new TelegramBot(token); // Убрали polling, добавили токен из env
-
-const topics = {
-    form10: { name: '10 класс', file: 'form10.json' },
-    form11: { name: '11 класс', file: 'form11.json' }
-};
-
-let userTopics = {};
-const QUIZ_LENGTH = 10;
-let userQuizProgress = {};
-let userQuizMark = {};
-
-function getQuestionsByTopics(userId) {
-    const selectedTopics = userTopics[userId] || Object.keys(topics);
-    let allQuestions = [];
-    selectedTopics.forEach(topic => {
-        try {
-            const questions = JSON.parse(fs.readFileSync(topics[topic].file, 'utf8'));
-            allQuestions = allQuestions.concat(questions);
-        } catch (error) {
-            console.error(`Ошибка при чтении файла ${topics[topic].file}:`, error);
-        }
-    });
-    return allQuestions;
+  console.error('TELEGRAM_BOT_TOKEN не установлен!');
+  process.exit(1);
 }
 
-function getRandomQuestion(userId) {
-    const questions = getQuestionsByTopics(userId);
-    if (questions.length === 0) {
-        return null;
-    }
-    const randomIndex = Math.floor(Math.random() * questions.length);
-    return questions[randomIndex];
+const bot = new TelegramBot(token);
+
+// Для хранения состояния викторины (в памяти — fallback, лучше использовать KV)
+let userQuizProgress = {}; // { userId: { currentQuestion: 0, currentPollId: null, answers: [] } }
+
+// Если есть KV (Vercel KV), используй его вместо памяти
+const { createClient } = require('@vercel/kv');
+let kv;
+if (process.env.KV_URL) {
+  kv = createClient({ url: process.env.KV_URL });
 }
 
-function sendQuiz(chatId, userId) {
-    if (!userQuizProgress[userId]) {
-        userQuizProgress[userId] = { answered: 0 };
-    }
-    if (!userQuizMark[userId]) {
-        userQuizMark[userId] = { correct: 0 }; // Исправлено: correct вместо answered
-    }
+// Вопросы викторины — fallback, если JSON нет
+const defaultQuestions = [
+  { question: 'Вопрос 1?', options: ['A', 'B', 'C', 'D'], correct: 0 },
+  // Добавь остальные вопросы или загружай из JSON
+];
 
-    const questionData = getRandomQuestion(userId);
-
-    if (!questionData) {
-        bot.sendMessage(chatId, "Нет доступных вопросов по выбранным темам.");
-        return;
-    }
-
-    bot.sendPoll(
-        chatId,
-        questionData.question,
-        questionData.options,
-        {
-            type: 'quiz',
-            correct_option_id: questionData.correct_option_id,
-            is_anonymous: false
-        }
-    ).then(pollMessage => {
-        const pollId = pollMessage.poll.id;
-
-        function pollAnswerHandler(answer) {
-            if (answer.poll_id === pollId) {
-                const selectedOption = answer.option_ids[0];
-                const isCorrect = selectedOption === questionData.correct_option_id;
-
-                if (isCorrect) {
-                    userQuizMark[userId].correct++; // Считаем только правильные
-                } else {
-                    // Отправляем объяснение при неправильном ответе
-                    bot.sendMessage(chatId, `Неправильно! ${questionData.explanation}`);
-                }
-
-                userQuizProgress[userId].answered++;
-
-                if (userQuizProgress[userId].answered < QUIZ_LENGTH) {
-                    sendQuiz(chatId, userId);
-                } else {
-                    const correctAnswers = userQuizMark[userId].correct;
-                    bot.sendMessage(chatId, `Викторина завершена! Ваша оценка: ${correctAnswers}/${QUIZ_LENGTH}`);
-                    delete userQuizProgress[userId];
-                    delete userQuizMark[userId];
-                }
-                bot.removeListener('poll_answer', pollAnswerHandler);
-            }
-        }
-        bot.on('poll_answer', pollAnswerHandler);
-    }).catch(error => {
-        console.error("Ошибка при отправке опроса:", error);
-        bot.sendMessage(chatId, "Произошла ошибка при отправке викторины. Попробуйте позже.");
-    });
+// Загрузка вопросов из JSON (с fallback)
+let questions = defaultQuestions;
+try {
+  const fs = require('fs');
+  const form10 = JSON.parse(fs.readFileSync('form10.json', 'utf8'));
+  const form11 = JSON.parse(fs.readFileSync('form11.json', 'utf8'));
+  questions = [...form10, ...form11]; // Предполагаем, что это массивы вопросов
+} catch (err) {
+  console.warn('Файлы form10.json или form11.json не найдены, использую дефолтные вопросы:', err.message);
 }
 
+// Глобальный слушатель для poll_answer (теперь работает лучше в serverless)
+bot.on('poll_answer', async (answer) => {
+  const userId = answer.user.id;
+  console.log(`Poll answer from ${userId}:`, answer);
+
+  // Получить состояние из KV или памяти
+  let progress = userQuizProgress[userId];
+  if (kv) {
+    progress = await kv.get(`quiz:${userId}`);
+  }
+
+  if (!progress || answer.poll_id !== progress.currentPollId) {
+    console.log('Poll ID не совпадает или нет прогресса');
+    return;
+  }
+
+  // Проверить ответ
+  const currentQ = questions[progress.currentQuestion];
+  const isCorrect = answer.option_ids[0] === currentQ.correct;
+
+  // Сохранить ответ
+  progress.answers.push({ question: progress.currentQuestion, isCorrect });
+  progress.currentQuestion++;
+
+  // Обновить в KV или памяти
+  if (kv) {
+    await kv.set(`quiz:${userId}`, progress);
+  } else {
+    userQuizProgress[userId] = progress;
+  }
+
+  // Следующий вопрос или конец
+  if (progress.currentQuestion < questions.length) {
+    sendQuiz(userId);
+  } else {
+    bot.sendMessage(userId, `Викторина закончена! Правильных ответов: ${progress.answers.filter(a => a.isCorrect).length}/${progress.answers.length}`);
+    delete userQuizProgress[userId]; // Очистить
+    if (kv) await kv.del(`quiz:${userId}`);
+  }
+});
+
+// Функция отправки викторины
+async function sendQuiz(chatId) {
+  let progress = userQuizProgress[chatId];
+  if (kv) {
+    progress = await kv.get(`quiz:${chatId}`);
+  }
+
+  if (!progress) {
+    progress = { currentQuestion: 0, answers: [] };
+  }
+
+  const question = questions[progress.currentQuestion];
+  const poll = await bot.sendPoll(chatId, question.question, question.options, {
+    type: 'quiz',
+    correct_option_id: question.correct,
+    is_anonymous: false,
+  });
+
+  progress.currentPollId = poll.poll.id;
+
+  // Сохранить
+  if (kv) {
+    await kv.set(`quiz:${chatId}`, progress);
+  } else {
+    userQuizProgress[chatId] = progress;
+  }
+}
+
+// Обработчик /start
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, 'Привет! Напиши /quiz, чтобы начать викторину. Для выбора тем используй /settopic.');
-});
-
-bot.onText(/\/quiz/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-
-    userQuizProgress[userId] = { answered: 0 };
-    userQuizMark[userId] = { correct: 0 };
-    sendQuiz(chatId, userId);
-});
-
-
-// Обработчик команды /settopic
-bot.onText(/\/settopic/, (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-
-    const keyboard = Object.keys(topics).map(topicKey => ([
-        {
-            text: topics[topicKey].name + (userTopics[userId] && userTopics[userId].includes(topicKey) ? ' ✅' : ''),
-            callback_data: topicKey
-        }
-    ]));
-
-    const inlineKeyboard = {
-        reply_markup: {
-            inline_keyboard: keyboard
-        }
-    };
-
-    bot.sendMessage(chatId, "Выберите темы:", inlineKeyboard);
-    bot.sendMessage(chatId, "Для начала викторины нажмите /quiz");
-});
-
-bot.on('callback_query', (callbackQuery) => {
-    const message = callbackQuery.message;
-    const userId = callbackQuery.from.id;
-    const topicKey = callbackQuery.data;
-
-    if (!userTopics[userId]) {
-        userTopics[userId] = [];
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, 'Привет! Начнём викторину?', {
+    reply_markup: {
+      inline_keyboard: [[{ text: 'Да', callback_data: 'start_quiz' }]]
     }
-    if (userTopics[userId].includes(topicKey)) {
-        userTopics[userId] = userTopics[userId].filter(t => t !== topicKey);
-    } else {
-        userTopics[userId].push(topicKey);
-    }
-
-    const keyboard = Object.keys(topics).map(key => ([
-        {
-            text: topics[key].name + (userTopics[userId].includes(key) ? ' ✅' : ''),
-            callback_data: key
-        }
-    ]));
-
-    const inlineKeyboard = {
-        reply_markup: {
-            inline_keyboard: keyboard
-        }
-    };
-
-    bot.editMessageText("Выберите темы:", {
-        chat_id: message.chat.id,
-        message_id: message.message_id,
-        reply_markup: inlineKeyboard.reply_markup
-    });
+  });
 });
 
+// Обработчик callback_query
+bot.on('callback_query', (query) => {
+  const chatId = query.message.chat.id;
+  if (query.data === 'start_quiz') {
+    sendQuiz(chatId);
+  }
+});
 
-console.log('Бот готов к работе с webhook.');
-
-// Экспорт для Vercel (serverless-функция)
-module.exports = (req, res) => {
-    if (req.method === 'POST') {
-        bot.processUpdate(req.body);
-        res.status(200).end();
-    } else {
-        res.status(405).end();
+// Экспорт для Vercel (serverless)
+module.exports = async (req, res) => {
+  if (req.method === 'POST') {
+    try {
+      console.log('Webhook received:', JSON.stringify(req.body, null, 2));
+      await bot.processUpdate(req.body);
+      res.status(200).send('OK');
+    } catch (error) {
+      console.error('Error processing update:', error);
+      res.status(500).send('Error');
     }
+  } else {
+    res.status(405).send('Method not allowed');
+  }
 };
-
-console.log("Бот работает");
