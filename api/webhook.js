@@ -182,3 +182,4 @@ module.exports = (req, res) => {
     }
 };
 
+console.log("Бот работает");
