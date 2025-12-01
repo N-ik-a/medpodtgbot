@@ -1,240 +1,173 @@
+const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
+const fs = require('fs');
 
-// загрузка данных тем и вопросов
-const form10 = require('../form10.json');
-const form11 = require('../form11.json');
+// Получайте токен и URL из переменных окружения
+const TOKEN = process.env.TOKEN; // В Vercel задайте TOKEN
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // В Vercel задайте WEBHOOK_URL, например: https://your-vercel-domain.vercel.app
+
+const bot = new TelegramBot(TOKEN);
+const app = express();
+app.use(express.json());
+
+// Временное хранилище данных (замените на внешнее хранилище для продакшена)
+const userTopics = {};
+const userQuizProgress = {};
+const userQuizMark = {};
+
 const topics = {
-  form10: { name: '10 класс', data: form10 },
-  form11: { name: '11 класс', data: form11 }
+  math: { name: '10 класс', file: 'form10.json' },
+  english: { name: '11 класс', file: 'form11.json' }
 };
 
 const QUIZ_LENGTH = 10;
 
-// экспорт функции для Vercel (serverless)
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    res.status(405).send('Method Not Allowed');
+// Функция для получения вопросов по выбранным темам
+function getQuestionsByTopics(userId) {
+  const selectedTopics = userTopics[userId] || Object.keys(topics);
+  let allQuestions = [];
+  selectedTopics.forEach(topic => {
+    try {
+      const questions = JSON.parse(fs.readFileSync(topics[topic].file, 'utf8'));
+      allQuestions = allQuestions.concat(questions);
+    } catch (error) {
+      console.error(`Ошибка при чтении файла ${topics[topic].file}:`, error);
+    }
+  });
+  return allQuestions;
+}
+
+// Получить случайный вопрос
+function getRandomQuestion(userId) {
+  const questions = getQuestionsByTopics(userId);
+  if (questions.length === 0) return null;
+  const randomIndex = Math.floor(Math.random() * questions.length);
+  return questions[randomIndex];
+}
+
+// Отправка викторины
+async function sendQuiz(chatId, userId) {
+  if (!userQuizProgress[userId]) {
+    userQuizProgress[userId] = { answered: 0 };
+  }
+  if (!userQuizMark[userId]) {
+    userQuizMark[userId] = { answered: 0 };
+  }
+
+  const questionData = getRandomQuestion(userId);
+  if (!questionData) {
+    await bot.sendMessage(chatId, "Нет доступных вопросов по выбранным темам.");
     return;
   }
 
   try {
-    const update = req.body;
-
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    if (!token) throw new Error('TELEGRAM_BOT_TOKEN не установлен в окружении');
-
-    // создаём бот без polling и обрабатываем Update напрямую (webhook-style)
-    const bot = new TelegramBot(token, { polling: false });
-
-    // Опционально попытаться установить вебхук (если вы задали VERCEL_URL)
-    if (process.env.VERCEL_URL) {
-      try {
-        await bot.setWebHook(`${process.env.VERCEL_URL}/api/bot`);
-      } catch (e) {
-        // игнорируем, может быть уже установлен или недоступен
-      }
-    }
-
-    
-      const data = await resp.json();
-      if (data && data.result !== undefined) {
-        try {
-          return JSON.parse(data.result);
-        } catch {
-          return data.result;
-        }
-      }
-      return null;
-    }
-
-    
-
-    async function getUserTopics(userId) {
-      const data = await redisGet(`quiz:user:${userId}:topics`);
-      return Array.isArray(data) ? data : (data ? [data] : []);
-    }
-
-    async function setUserTopics(userId, arr) {
-      await redisSet(`quiz:user:${userId}:topics`, arr);
-    }
-
-    async function getProgress(userId) {
-      const p = await redisGet(`quiz:user:${userId}:progress`);
-      return p || { answered: 0 };
-    }
-
-    async function setProgress(userId, obj) {
-      await redisSet(`quiz:user:${userId}:progress`, obj);
-    }
-
-    async function getMark(userId) {
-      const m = await redisGet(`quiz:user:${userId}:mark`);
-      return m || { answered: 0 };
-    }
-
-    async function setMark(userId, obj) {
-      await redisSet(`quiz:user:${userId}:mark`, obj);
-    }
-
-    async function getQuestionsByTopics(userId) {
-      const selectedTopics = await getUserTopics(userId);
-      const keys = selectedTopics && selectedTopics.length ? selectedTopics : Object.keys(topics);
-      let all = [];
-      for (const tKey of keys) {
-        const arr = topics[tKey]?.data;
-        if (Array.isArray(arr)) all = all.concat(arr);
-      }
-      return all;
-    }
-
-    async function getRandomQuestion(userId) {
-      const questions = await getQuestionsByTopics(userId);
-      if (!questions || questions.length === 0) return null;
-      const idx = Math.floor(Math.random() * questions.length);
-      return questions[idx];
-    }
-
-    async function sendQuiz(chatId, userId) {
-      let progressObj = await getProgress(userId);
-      if (!progressObj) progressObj = { answered: 0 };
-      let markObj = await getMark(userId);
-      if (!markObj) markObj = { answered: 0 };
-
-      const questionData = await getRandomQuestion(userId);
-      if (!questionData) {
-        await bot.sendMessage(chatId, 'Нет доступных вопросов по выбранным темам.');
-        return;
-      }
-
-      bot
-        .sendPoll(
-          chatId,
-          questionData.question,
-          questionData.options,
-          {
-            type: 'quiz',
-            correct_option_id: questionData.correct_option_id,
-            is_anonymous: false
-          }
-        )
-        .then(async (pollMessage) => {
-          const pollId = pollMessage.poll.id;
-
-          async function pollAnswerHandler(answer) {
-            if (answer.poll_id === pollId) {
-              const selectedOption = answer.option_ids[0];
-              const isCorrect = selectedOption === questionData.correct_option_id;
-
-              if (!isCorrect) {
-                const feedback =
-                  (questionData.explanation ? questionData.explanation + '\n\n' : '');
-                await bot.sendMessage(chatId, feedback);
-              } else {
-                const m = await getMark(userId);
-                m.answered += 1;
-                await setMark(userId, m);
-              }
-
-              // обновляем прогресс
-              let p = await getProgress(userId);
-              p.answered += 1;
-              await setProgress(userId, p);
-
-              if (p.answered < QUIZ_LENGTH) {
-                await sendQuiz(chatId, userId);
-              } else {
-                const score = (await getMark(userId)).answered;
-                await bot.sendMessage(chatId, `Викторина завершена! Ваша оценка ${score}`);
-                // сброс состояния
-                await setProgress(userId, { answered: 0 });
-                await setMark(userId, { answered: 0 });
-              }
-
-              bot.removeListener('poll_answer', pollAnswerHandler);
-            }
-          }
-
-          bot.on('poll_answer', pollAnswerHandler);
-        })
-        .catch((err) => {
-          console.error('Ошибка при отправке опроса:', err);
-          bot.sendMessage(chatId, 'Произошла ошибка при отправке викторины. Попробуйте позже.');
-        });
-    }
-
-    // Команды и обработчики
-    bot.onText(/\/start/, (msg) => {
-      bot.sendMessage(
-        msg.chat.id,
-        'Привет! Напиши /quiz, чтобы начать викторину. Для выбора тем используй /settopic.'
-      );
+    const pollMessage = await bot.sendPoll(chatId, questionData.question, questionData.options, {
+      type: 'quiz',
+      correct_option_id: questionData.correct_option_id,
+      is_anonymous: false
     });
+    const pollId = pollMessage.poll.id;
 
-    bot.onText(/\/quiz/, (msg) => {
-      const chatId = msg.chat.id;
-      const userId = msg.from.id;
-      // инициализация прогресса
-      setProgress(userId, { answered: 0 });
-      setMark(userId, { answered: 0 });
-      sendQuiz(chatId, userId);
-    });
+    const pollAnswerHandler = (answer) => {
+      if (answer.poll_id === pollId) {
+        const selectedOption = answer.option_ids[0];
+        const isCorrect = selectedOption === questionData.correct_option_id;
 
-    bot.onText(/\/settopic/, (msg) => {
-      const chatId = msg.chat.id;
-      const userId = msg.from.id;
-
-      (async () => {
-        const userTs = await getUserTopics(userId);
-        // кнопки тем
-        const keyboard = Object.keys(topics).map((tk) => [
-          {
-            text: topics[tk].name + (userTs.includes(tk) ? ' ✅' : ''),
-            callback_data: tk
-          }
-        ]);
-        const inlineKeyboard = { reply_markup: { inline_keyboard: keyboard } };
-        await bot.sendMessage(chatId, 'Выберите темы:', inlineKeyboard);
-      })();
-    });
-
-    bot.on('callback_query', (callbackQuery) => {
-      const message = callbackQuery.message;
-      const userId = callbackQuery.from.id;
-      const topicKey = callbackQuery.data;
-
-      (async () => {
-        let current = await getUserTopics(userId);
-        if (!Array.isArray(current)) current = [];
-
-        if (current.includes(topicKey)) {
-          current = current.filter((t) => t !== topicKey);
+        if (!isCorrect) {
+          bot.sendMessage(chatId, questionData.explanation + '\n\n');
         } else {
-          current.push(topicKey);
+          userQuizMark[userId].answered++;
         }
 
-        await setUserTopics(userId, current);
+        userQuizProgress[userId].answered++;
 
-        const keyboard = Object.keys(topics).map((tk) => [
-          {
-            text: topics[tk].name + (current.includes(tk) ? ' ✅' : ''),
-            callback_data: tk
-          }
-        ]);
-        const inlineKeyboard = { reply_markup: { inline_keyboard: keyboard } };
-        await bot.editMessageText('Выберите темы:', {
-          chat_id: message.chat.id,
-          message_id: message.message_id,
-          reply_markup: inlineKeyboard.reply_markup
-        });
-      })();
-    });
+        if (userQuizProgress[userId].answered < QUIZ_LENGTH) {
+          sendQuiz(chatId, userId);
+        } else {
+          const correctAnswers = userQuizMark[userId].answered;
+          bot.sendMessage(chatId, `Викторина завершена! Ваша оценка ${correctAnswers}`);
+          delete userQuizProgress[userId];
+          delete userQuizMark[userId];
+        }
+        bot.removeListener('poll_answer', pollAnswerHandler);
+      }
+    };
 
-    // Обработчик самого обновления Telegram
-    await bot.processUpdate(update);
-
-    res.status(200).send('ok');
-  } catch (err) {
-    console.error('Ошибка обработки обновления Telegram:', err);
-    res.status(500).send('Internal Server Error');
+    bot.on('poll_answer', pollAnswerHandler);
+  } catch (error) {
+    console.error('Ошибка при отправке опроса:', error);
+    bot.sendMessage(chatId, 'Произошла ошибка при отправке викторины. Попробуйте позже.');
   }
-};
+}
+
+// Обработка команд
+bot.on('message', (msg) => {
+  const chatId = msg.chat.id;
+  if (msg.text === '/start') {
+    bot.sendMessage(chatId, 'Привет! Напиши /quiz, чтобы начать викторину. Для выбора тем используй /settopic.');
+  } else if (msg.text === '/quiz') {
+    const userId = msg.from.id;
+    userQuizProgress[userId] = { answered: 0 };
+    userQuizMark[userId] = { answered: 0 };
+    sendQuiz(chatId, userId);
+  } else if (msg.text === '/settopic') {
+    // Отправляем inline клавиатуру для выбора тем
+    const keyboard = Object.keys(topics).map(topicKey => ([
+      {
+        text: topics[topicKey].name + (userTopics[msg.from.id] && userTopics[msg.from.id].includes(topicKey) ? ' ✅' : ''),
+        callback_data: topicKey
+      }
+    ]));
+    bot.sendMessage(chatId, 'Выберите темы:', {
+      reply_markup: { inline_keyboard: keyboard }
+    });
+  }
+});
+
+// Обработка callback-кнопок
+bot.on('callback_query', (callbackQuery) => {
+  const message = callbackQuery.message;
+  const userId = callbackQuery.from.id;
+  const topicKey = callbackQuery.data;
+
+  if (!userTopics[userId]) {
+    userTopics[userId] = [];
+  }
+
+  if (userTopics[userId].includes(topicKey)) {
+    userTopics[userId] = userTopics[userId].filter(t => t !== topicKey);
+  } else {
+    userTopics[userId].push(topicKey);
+  }
+
+  // Обновление клавиатуры
+  const keyboard = Object.keys(topics).map(topicKey => ([
+    {
+      text: topics[topicKey].name + (userTopics[userId].includes(topicKey) ? ' ✅' : ''),
+      callback_data: topicKey
+    }
+  ]));
+
+  bot.editMessageText('Выберите темы:', {
+    chat_id: message.chat.id,
+    message_id: message.message_id,
+    reply_markup: { inline_keyboard: keyboard }
+  });
+});
+
+// Настройка webhook
+app.post(`/${TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Запуск сервера и установка webhook
+app.listen(3000, async () => {
+  console.log('Server started');
+  try {
+    await bot.setWebHook(`${WEBHOOK_URL}/${TOKEN}`);
+    console.log('Webhook установлен');
+  } catch (err) {
+    console.error('Ошибка установки webhook:', err);
+  }
+});
