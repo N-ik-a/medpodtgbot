@@ -1,7 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 
-const token = '8453905301:AAFr0M4FEO-bxnW7iKRVGgTQlUGmuN8QsZA';
+const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
     throw new Error('TELEGRAM_BOT_TOKEN не установлен');
 }
@@ -181,3 +181,4 @@ module.exports = (req, res) => {
         res.status(405).end();
     }
 };
+
